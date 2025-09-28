@@ -18,7 +18,7 @@ from homeassistant.exceptions import ConfigEntryAuthFailed
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity import generate_entity_id
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from vulcan import UnauthorizedCertificateException
+from .iris import CertificateNotFoundException
 
 from . import DOMAIN
 from .fetch_data import get_exams_list, get_homework_list, get_lessons, get_student_info
@@ -121,7 +121,7 @@ class VulcanLessonsCalendarEntity(CalendarEntity):
                 date_to=end_date,
                 type_="list",
             )
-        except UnauthorizedCertificateException as err:
+        except CertificateNotFoundException as err:
             raise ConfigEntryAuthFailed(
                 "The certificate is not authorized, please authorize integration again"
             ) from err
@@ -136,10 +136,10 @@ class VulcanLessonsCalendarEntity(CalendarEntity):
         for item in events:
             try:
                 event = CalendarEvent(
-                    start=datetime.combine(item["date"], item["time"].from_).replace(
+                    start=datetime.combine(item["date"], item["time"].start).replace(
                         tzinfo=ZoneInfo("Europe/Warsaw")
                     ),
-                    end=datetime.combine(item["date"], item["time"].to).replace(
+                    end=datetime.combine(item["date"], item["time"].end).replace(
                         tzinfo=ZoneInfo("Europe/Warsaw")
                     ),
                     summary=item["lesson"],
@@ -172,7 +172,7 @@ class VulcanLessonsCalendarEntity(CalendarEntity):
                 if events == []:
                     self._event = None
                     return
-        except UnauthorizedCertificateException as err:
+        except CertificateNotFoundException as err:
             raise ConfigEntryAuthFailed(
                 "The certificate is not authorized, please authorize integration again"
             ) from err
@@ -193,9 +193,9 @@ class VulcanLessonsCalendarEntity(CalendarEntity):
         )
         self._event = CalendarEvent(
             start=datetime.combine(
-                new_event["date"], new_event["time"].from_
+                new_event["date"], new_event["time"].start
             ).astimezone(ZoneInfo("Europe/Warsaw")),
-            end=datetime.combine(new_event["date"], new_event["time"].to).astimezone(
+            end=datetime.combine(new_event["date"], new_event["time"].end).astimezone(
                 ZoneInfo("Europe/Warsaw")
             ),
             summary=new_event["lesson"],
@@ -252,7 +252,7 @@ class VulcanExamsCalendarEntity(CalendarEntity):
                 date_from=start_date,
                 date_to=end_date,
             )
-        except UnauthorizedCertificateException as err:
+        except CertificateNotFoundException as err:
             raise ConfigEntryAuthFailed(
                 "The certificate is not authorized, please authorize integration again"
             ) from err
@@ -267,10 +267,10 @@ class VulcanExamsCalendarEntity(CalendarEntity):
         for item in events:
             event = CalendarEvent(
                 start=datetime.combine(
-                    item["date"], item["time"].from_ if item["time"] else time(0, 0)
+                    item["date"], item["time"].start if item["time"] else time(0, 0)
                 ).replace(tzinfo=ZoneInfo("Europe/Warsaw")),
                 end=datetime.combine(
-                    item["date"], item["time"].to if item["time"] else time(0, 0)
+                    item["date"], item["time"].end if item["time"] else time(0, 0)
                 ).replace(tzinfo=ZoneInfo("Europe/Warsaw")),
                 summary=f"{item['title']} - {item['subject']} ({item['type']})",
                 description=f"{item['title']}\nPrzedmiot: {item['subject']}\nTyp: {item['type']}\nNauczyciel: {item['teacher']}",
@@ -293,7 +293,7 @@ class VulcanExamsCalendarEntity(CalendarEntity):
             if events == []:
                 self._event = None
                 return
-        except UnauthorizedCertificateException as err:
+        except CertificateNotFoundException as err:
             raise ConfigEntryAuthFailed(
                 "The certificate is not authorized, please authorize integration again"
             ) from err
@@ -308,11 +308,11 @@ class VulcanExamsCalendarEntity(CalendarEntity):
         new_event = min(
             events,
             key=lambda d: (
-                datetime.combine(d["date"], d["time"].to if d["time"] else time(0, 0))
+                datetime.combine(d["date"], d["time"].end if d["time"] else time(0, 0))
                 < datetime.now(),
                 abs(
                     datetime.combine(
-                        d["date"], d["time"].to if d["time"] else time(0, 0)
+                        d["date"], d["time"].end if d["time"] else time(0, 0)
                     )
                     - datetime.now()
                 ),
@@ -325,7 +325,7 @@ class VulcanExamsCalendarEntity(CalendarEntity):
             ).replace(tzinfo=ZoneInfo("Europe/Warsaw")),
             end=datetime.combine(
                 new_event["date"],
-                new_event["time"].to if new_event["time"] else time(0, 0),
+                new_event["time"].end if new_event["time"] else time(0, 0),
             ).replace(tzinfo=ZoneInfo("Europe/Warsaw")),
             summary=f"{new_event['title']} - {new_event['subject']} ({new_event['type']})",
             description=f"{new_event['title']}\nPrzedmiot: {new_event['subject']}\nTyp: {new_event['type']}\nNauczyciel: {new_event['teacher']}",
@@ -380,7 +380,7 @@ class VulcanHomeworkCalendarEntity(CalendarEntity):
                 date_from=start_date,
                 date_to=end_date,
             )
-        except UnauthorizedCertificateException as err:
+        except CertificateNotFoundException as err:
             raise ConfigEntryAuthFailed(
                 "The certificate is not authorized, please authorize integration again"
             ) from err
@@ -421,7 +421,7 @@ class VulcanHomeworkCalendarEntity(CalendarEntity):
             if events == []:
                 self._event = None
                 return
-        except UnauthorizedCertificateException as err:
+        except CertificateNotFoundException as err:
             raise ConfigEntryAuthFailed(
                 "The certificate is not authorized, please authorize integration again"
             ) from err

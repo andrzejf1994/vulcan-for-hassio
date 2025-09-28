@@ -1,5 +1,7 @@
 """Adds config flow for Vulcan."""
 
+from __future__ import annotations
+
 import logging
 
 import homeassistant.helpers.config_validation as cv
@@ -9,16 +11,6 @@ from homeassistant import config_entries
 from homeassistant.const import CONF_PIN, CONF_REGION, CONF_SCAN_INTERVAL, CONF_TOKEN
 from homeassistant.core import callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
-from vulcan import (
-    Account,
-    ExpiredTokenException,
-    InvalidPINException,
-    InvalidSymbolException,
-    InvalidTokenException,
-    Keystore,
-    UnauthorizedCertificateException,
-    Vulcan,
-)
 
 from . import DOMAIN
 from .const import (
@@ -29,6 +21,18 @@ from .const import (
     DEFAULT_LESSON_ENTITIES_NUMBER,
     DEFAULT_SCAN_INTERVAL,
 )
+from .iris import (
+    CertificateNotFoundException,
+    ExpiredTokenException,
+    FailedRequestException,
+    HttpUnsuccessfullStatusException,
+    MissingUnitSymbolException,
+    UsedTokenException,
+    WrongPINException,
+    WrongTokenException,
+)
+from .iris.credentials import RsaCredential
+from .iris_client import IrisClient
 from .register import register
 
 _LOGGER = logging.getLogger(__name__)
@@ -40,6 +44,14 @@ LOGIN_SCHEMA = {
 }
 
 
+def _format_student_name(student) -> str:
+    parts: list[str] = [student.pupil.first_name]
+    if student.pupil.second_name:
+        parts.append(student.pupil.second_name)
+    parts.append(student.pupil.surname)
+    return " ".join(part for part in parts if part)
+
+
 class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     """Handle a Uonet+ Vulcan config flow."""
 
@@ -47,9 +59,8 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
     def __init__(self):
         """Initialize config flow."""
-        self.account = None
-        self.keystore = None
-        self.students = None
+        self.credential: RsaCredential | None = None
+        self.students: list | None = None
 
     @staticmethod
     @callback
@@ -69,46 +80,44 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
 
         if user_input is not None:
             try:
-                credentials = await register(
+                credential = await register(
                     self.hass,
                     user_input[CONF_TOKEN],
                     user_input[CONF_REGION],
                     user_input[CONF_PIN],
                 )
-            except InvalidSymbolException:
+                client = IrisClient(credential, async_get_clientsession(self.hass))
+                students = await client.get_students()
+            except MissingUnitSymbolException:
                 errors = {"base": "invalid_symbol"}
-            except InvalidTokenException:
+            except (WrongTokenException, UsedTokenException):
                 errors = {"base": "invalid_token"}
-            except InvalidPINException:
+            except WrongPINException:
                 errors = {"base": "invalid_pin"}
             except ExpiredTokenException:
                 errors = {"base": "expired_token"}
+            except (FailedRequestException, HttpUnsuccessfullStatusException) as err:
+                errors = {"base": "cannot_connect"}
+                _LOGGER.error("Connection error: %s", err)
             except ClientConnectionError as err:
                 errors = {"base": "cannot_connect"}
                 _LOGGER.error("Connection error: %s", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception")
                 errors = {"base": "unknown"}
-            if not errors:
-                account = credentials["account"]
-                keystore = credentials["keystore"]
-                client = Vulcan(keystore, account, async_get_clientsession(self.hass))
-                students = await client.get_students()
-
+            else:
                 if len(students) > 1:
-                    self.account = account
-                    self.keystore = keystore
+                    self.credential = credential
                     self.students = students
                     return await self.async_step_select_student()
                 student = students[0]
                 await self.async_set_unique_id(str(student.pupil.id))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
-                    title=f"{student.pupil.first_name} {student.pupil.last_name}",
+                    title=_format_student_name(student),
                     data={
                         "student_id": str(student.pupil.id),
-                        "keystore": keystore.as_dict,
-                        "account": account.as_dict,
+                        "credential": credential.model_dump(mode="json"),
                     },
                 )
 
@@ -124,10 +133,8 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         students = {}
         if self.students is not None:
             for student in self.students:
-                students[str(student.pupil.id)] = (
-                    f"{student.pupil.first_name} {student.pupil.last_name}"
-                )
-        if user_input is not None:
+                students[str(student.pupil.id)] = _format_student_name(student)
+        if user_input is not None and self.credential is not None:
             student_id = user_input["student"]
             await self.async_set_unique_id(str(student_id))
             self._abort_if_unique_id_configured()
@@ -135,8 +142,7 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 title=students[student_id],
                 data={
                     "student_id": str(student_id),
-                    "keystore": self.keystore.as_dict,
-                    "account": self.account.as_dict,
+                    "credential": self.credential.model_dump(mode="json"),
                 },
             )
 
@@ -149,20 +155,22 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_select_saved_credentials(self, user_input=None, errors=None):
         """Allow user to select saved credentials."""
 
-        credentials = {}
+        credentials: dict[str, str] = {}
         for entry in self.hass.config_entries.async_entries(DOMAIN):
-            credentials[entry.entry_id] = entry.data["account"]["UserName"]
+            credentials[entry.entry_id] = entry.title or entry.data["student_id"]
 
         if user_input is not None:
             entry = self.hass.config_entries.async_get_entry(user_input["credentials"])
-            keystore = Keystore.load(entry.data["keystore"])
-            account = Account.load(entry.data["account"])
-            client = Vulcan(keystore, account, async_get_clientsession(self.hass))
+            credential = RsaCredential.model_validate(entry.data["credential"])
+            client = IrisClient(credential, async_get_clientsession(self.hass))
             try:
                 students = await client.get_students()
-            except UnauthorizedCertificateException:
-                return await self.async_step_auth(
-                    errors={"base": "expired_credentials"}
+            except CertificateNotFoundException:
+                return await self.async_step_auth(errors={"base": "expired_credentials"})
+            except (FailedRequestException, HttpUnsuccessfullStatusException) as err:
+                _LOGGER.error("Connection error: %s", err)
+                return await self.async_step_select_saved_credentials(
+                    errors={"base": "cannot_connect"}
                 )
             except ClientConnectionError as err:
                 _LOGGER.error("Connection error: %s", err)
@@ -177,15 +185,13 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 await self.async_set_unique_id(str(student.pupil.id))
                 self._abort_if_unique_id_configured()
                 return self.async_create_entry(
-                    title=f"{student.pupil.first_name} {student.pupil.last_name}",
+                    title=_format_student_name(student),
                     data={
                         "student_id": str(student.pupil.id),
-                        "keystore": keystore.as_dict,
-                        "account": account.as_dict,
+                        "credential": credential.model_dump(mode="json"),
                     },
                 )
-            self.account = account
-            self.keystore = keystore
+            self.credential = credential
             self.students = students
             return await self.async_step_select_student()
 
@@ -203,9 +209,7 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
     async def async_step_add_next_config_entry(self, user_input=None):
         """Flow initialized when user is adding next entry of that integration."""
 
-        existing_entries = []
-        for entry in self.hass.config_entries.async_entries(DOMAIN):
-            existing_entries.append(entry)
+        existing_entries = list(self.hass.config_entries.async_entries(DOMAIN))
 
         errors = {}
 
@@ -214,34 +218,44 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
                 return await self.async_step_auth()
             if len(existing_entries) > 1:
                 return await self.async_step_select_saved_credentials()
-            keystore = Keystore.load(existing_entries[0].data["keystore"])
-            account = Account.load(existing_entries[0].data["account"])
-            client = Vulcan(keystore, account, async_get_clientsession(self.hass))
-            students = await client.get_students()
-            new_students = []
-            existing_entry_ids = []
-            for entry in self.hass.config_entries.async_entries(DOMAIN):
-                existing_entry_ids.append(entry.data["student_id"])
-            for student in students:
-                if str(student.pupil.id) not in existing_entry_ids:
-                    new_students.append(student)
-            if not new_students:
-                return self.async_abort(reason="all_student_already_configured")
-            if len(new_students) == 1:
-                await self.async_set_unique_id(str(new_students[0].pupil.id))
-                self._abort_if_unique_id_configured()
-                return self.async_create_entry(
-                    title=f"{new_students[0].pupil.first_name} {new_students[0].pupil.last_name}",
-                    data={
-                        "student_id": str(new_students[0].pupil.id),
-                        "keystore": keystore.as_dict,
-                        "account": account.as_dict,
-                    },
-                )
-            self.account = account
-            self.keystore = keystore
-            self.students = new_students
-            return await self.async_step_select_student()
+            credential = RsaCredential.model_validate(
+                existing_entries[0].data["credential"]
+            )
+            client = IrisClient(credential, async_get_clientsession(self.hass))
+            try:
+                students = await client.get_students()
+            except CertificateNotFoundException:
+                return await self.async_step_auth(errors={"base": "expired_credentials"})
+            except (FailedRequestException, HttpUnsuccessfullStatusException) as err:
+                _LOGGER.error("Connection error: %s", err)
+                errors = {"base": "cannot_connect"}
+            except ClientConnectionError as err:
+                _LOGGER.error("Connection error: %s", err)
+                errors = {"base": "cannot_connect"}
+            else:
+                existing_entry_ids = [
+                    entry.data["student_id"] for entry in existing_entries
+                ]
+                new_students = [
+                    student
+                    for student in students
+                    if str(student.pupil.id) not in existing_entry_ids
+                ]
+                if not new_students:
+                    return self.async_abort(reason="all_student_already_configured")
+                if len(new_students) == 1:
+                    await self.async_set_unique_id(str(new_students[0].pupil.id))
+                    self._abort_if_unique_id_configured()
+                    return self.async_create_entry(
+                        title=_format_student_name(new_students[0]),
+                        data={
+                            "student_id": str(new_students[0].pupil.id),
+                            "credential": credential.model_dump(mode="json"),
+                        },
+                    )
+                self.credential = credential
+                self.students = new_students
+                return await self.async_step_select_student()
 
         data_schema = {
             vol.Required("use_saved_credentials", default=True): bool,
@@ -261,48 +275,50 @@ class VulcanFlowHandler(config_entries.ConfigFlow, domain=DOMAIN):
         errors = {}
         if user_input is not None:
             try:
-                credentials = await register(
+                credential = await register(
                     self.hass,
                     user_input[CONF_TOKEN],
                     user_input[CONF_REGION],
                     user_input[CONF_PIN],
                 )
-            except InvalidSymbolException:
+                client = IrisClient(credential, async_get_clientsession(self.hass))
+                students = await client.get_students()
+            except MissingUnitSymbolException:
                 errors = {"base": "invalid_symbol"}
-            except InvalidTokenException:
+            except (WrongTokenException, UsedTokenException):
                 errors = {"base": "invalid_token"}
-            except InvalidPINException:
+            except WrongPINException:
                 errors = {"base": "invalid_pin"}
             except ExpiredTokenException:
                 errors = {"base": "expired_token"}
+            except (FailedRequestException, HttpUnsuccessfullStatusException) as err:
+                errors["base"] = "cannot_connect"
+                _LOGGER.error("Connection error: %s", err)
             except ClientConnectionError as err:
                 errors["base"] = "cannot_connect"
                 _LOGGER.error("Connection error: %s", err)
             except Exception:  # pylint: disable=broad-except
                 _LOGGER.exception("Unexpected exception")
                 errors["base"] = "unknown"
-            if not errors:
-                account = credentials["account"]
-                keystore = credentials["keystore"]
-                client = Vulcan(keystore, account, async_get_clientsession(self.hass))
-                students = await client.get_students()
-                existing_entries = []
-                for entry in self.hass.config_entries.async_entries(DOMAIN):
-                    existing_entries.append(entry)
+            else:
+                existing_entries = list(
+                    self.hass.config_entries.async_entries(DOMAIN)
+                )
                 matching_entries = False
                 for student in students:
                     for entry in existing_entries:
                         if str(student.pupil.id) == str(entry.data["student_id"]):
                             self.hass.config_entries.async_update_entry(
                                 entry,
-                                title=f"{student.pupil.first_name} {student.pupil.last_name}",
+                                title=_format_student_name(student),
                                 data={
                                     "student_id": str(student.pupil.id),
-                                    "keystore": keystore.as_dict,
-                                    "account": account.as_dict,
+                                    "credential": credential.model_dump(mode="json"),
                                 },
                             )
-                            await self.hass.config_entries.async_reload(entry.entry_id)
+                            await self.hass.config_entries.async_reload(
+                                entry.entry_id
+                            )
                             matching_entries = True
                 if not matching_entries:
                     return self.async_abort(reason="no_matching_entries")
