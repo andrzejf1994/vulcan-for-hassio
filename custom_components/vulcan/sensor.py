@@ -18,7 +18,7 @@ from homeassistant.helpers.update_coordinator import (
     DataUpdateCoordinator,
     UpdateFailed,
 )
-from vulcan import UnauthorizedCertificateException
+from .iris import CertificateNotFoundException
 
 from . import DOMAIN, VulcanEntity
 from .const import (
@@ -73,7 +73,7 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                         ),
                     ),
                 }
-        except UnauthorizedCertificateException:
+        except CertificateNotFoundException:
             _LOGGER.error(
                 "The certificate is not authorized, please authorize integration again."
             )

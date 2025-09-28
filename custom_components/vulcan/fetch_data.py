@@ -1,100 +1,104 @@
-"""Support for fetching Vulcan data."""
+"""Helper utilities for fetching data from the Iris API."""
+
+from __future__ import annotations
 
 import datetime
 import re
 from zoneinfo import ZoneInfo
 
+from .iris_client import IrisClient
+
+
+def _default_date(date_value: datetime.date | None) -> datetime.date:
+    return date_value or datetime.date.today()
+
 
 async def get_lessons(
-    client, date_from=None, date_to=None, type_="dict", entities_number=10
+    client: IrisClient,
+    date_from: datetime.date | None = None,
+    date_to: datetime.date | None = None,
+    type_: str = "dict",
+    entities_number: int = 10,
 ):
     """Support for fetching Vulcan lessons."""
-    dict_ans = {}
-    changes = {}
-    list_ans = []
-    async for lesson in await client.data.get_changed_lessons(
-        date_from=date_from, date_to=date_to
-    ):
-        temp_dict = {}
-        _id = str(lesson.id)
-        temp_dict["id"] = lesson.id
-        temp_dict["number"] = lesson.time.position if lesson.time is not None else None
-        temp_dict["lesson"] = (
-            lesson.subject.name if lesson.subject is not None else None
-        )
-        temp_dict["room"] = lesson.room.code if lesson.room is not None else None
-        temp_dict["changes"] = lesson.changes
-        temp_dict["note"] = lesson.note
-        temp_dict["reason"] = lesson.reason
-        temp_dict["event"] = lesson.event
-        temp_dict["group"] = lesson.group
-        temp_dict["teacher"] = (
-            lesson.teacher.display_name if lesson.teacher is not None else None
-        )
-        temp_dict["from_to"] = (
-            lesson.time.displayed_time if lesson.time is not None else None
-        )
 
-        changes[str(_id)] = temp_dict
-    async for lesson in await client.data.get_lessons(
-        date_from=date_from, date_to=date_to
-    ):
-        temp_dict = {}
-        temp_dict["id"] = lesson.id
-        temp_dict["number"] = lesson.time.position
-        temp_dict["time"] = lesson.time
-        temp_dict["date"] = lesson.date.date
-        temp_dict["lesson"] = (
-            lesson.subject.name if lesson.subject is not None else None
+    date_from = _default_date(date_from)
+    date_to = date_to or date_from
+
+    schedules = await client.get_schedule(date_from=date_from, date_to=date_to)
+    schedules.sort(key=lambda item: (item.date_, item.time_slot.position))
+
+    dict_ans: dict[str, dict] = {}
+    list_ans: list[dict] = []
+
+    for schedule in schedules:
+        substitution = schedule.substitution
+        change = substitution.change if substitution else None
+        change_type = change.type if change else None
+        reason = substitution.reason if substitution else None
+        teacher = (
+            substitution.teacher_primary.display_name
+            if substitution and substitution.teacher_primary
+            else schedule.teacher_primary.display_name
+            if schedule.teacher_primary
+            else "-"
         )
-        if lesson.event is not None:
-            temp_dict["lesson"] = (
-                lesson.event + f" - {temp_dict['lesson']}"
-                if temp_dict["lesson"] is not None
-                else lesson.event
+        room = (
+            substitution.room.code
+            if substitution and substitution.room
+            else schedule.room.code
+            if schedule.room
+            else "-"
+        )
+        base_name = schedule.subject.name if schedule.subject else "-"
+        if schedule.event:
+            base_name = (
+                f"{schedule.event} - {base_name}"
+                if base_name != "-"
+                else schedule.event
             )
-        if lesson.room is not None:
-            temp_dict["room"] = lesson.room.code
+        if substitution and substitution.event:
+            base_name = (
+                f"{substitution.event} - {base_name}"
+                if base_name != "-"
+                else substitution.event
+            )
+
+        lesson_title = base_name
+        if change_type in (1, 4):
+            lesson_title = f"Lekcja odwołana ({base_name})"
+        elif change_type == 2:
+            lesson_title = f"{base_name} (Zastępstwo)"
+
+        entry = {
+            "id": schedule.id,
+            "number": schedule.time_slot.position,
+            "time": schedule.time_slot,
+            "date": schedule.date_,
+            "lesson": lesson_title,
+            "room": room or "-",
+            "visible": True,
+            "group": (
+                schedule.distribution.name
+                if schedule.distribution
+                else schedule.clazz.display_name
+            ),
+            "reason": reason,
+            "teacher": teacher or "-",
+            "from_to": schedule.time_slot.display,
+            "note": substitution.pupil_note if substitution else None,
+        }
+
+        if type_ == "dict":
+            dict_ans[f"lesson_{schedule.time_slot.position}"] = entry
         else:
-            temp_dict["room"] = "-"
-        temp_dict["visible"] = lesson.visible
-        temp_dict["changes"] = lesson.changes
-        temp_dict["group"] = lesson.group
-        temp_dict["reason"] = None
-        temp_dict["teacher"] = (
-            lesson.teacher.display_name if lesson.teacher is not None else None
-        )
-        temp_dict["from_to"] = (
-            lesson.time.displayed_time if lesson.time is not None else None
-        )
-        if temp_dict["changes"] is None:
-            temp_dict["changes"] = ""
-        elif temp_dict["changes"].type == 1:
-            temp_dict["lesson"] = f"Lekcja odwołana ({temp_dict['lesson']})"
-            temp_dict["changes_info"] = f"Lekcja odwołana ({temp_dict['lesson']})"
-            if str(temp_dict["changes"].id) in changes:
-                temp_dict["reason"] = changes[str(temp_dict["changes"].id)]["reason"]
-        elif temp_dict["changes"].type == 2:
-            temp_dict["lesson"] = f"{temp_dict['lesson']} (Zastępstwo)"
-            if str(temp_dict["changes"].id) in changes:
-                temp_dict["teacher"] = changes[str(temp_dict["changes"].id)]["teacher"]
-                temp_dict["reason"] = changes[str(temp_dict["changes"].id)]["reason"]
-        # elif temp_dict["changes"].type == 3:
-        # temp_dict["lesson"] = f"Lekcja przeniesiona ({temp_dict['lesson']})"
-        # temp_dict["reason"] = changes[str(temp_dict["changes"].id)]["reason"]
-        elif temp_dict["changes"].type == 4:
-            temp_dict["lesson"] = f"Lekcja odwołana ({temp_dict['lesson']})"
-            if str(temp_dict["changes"].id) in changes:
-                temp_dict["reason"] = changes[str(temp_dict["changes"].id)]["reason"]
-        if temp_dict["visible"]:
-            if type_ == "dict":
-                dict_ans[f"lesson_{lesson.time.position}"] = temp_dict
-            elif type_ == "list":
-                list_ans.append(temp_dict)
+            list_ans.append(entry)
+
     if type_ == "dict":
         for num in range(entities_number):
-            if f"lesson_{str(num + 1)}" not in dict_ans:
-                dict_ans[f"lesson_{str(num + 1)}"] = {
+            key = f"lesson_{num + 1}"
+            if key not in dict_ans:
+                dict_ans[key] = {
                     "number": num + 1,
                     "lesson": "-",
                     "room": "-",
@@ -102,76 +106,75 @@ async def get_lessons(
                     "group": "-",
                     "teacher": "-",
                     "from_to": "-",
-                    "changes": "-",
                     "reason": None,
                 }
-    if type_ == "dict":
         return dict_ans
-    elif type_ == "list":
-        return list_ans
+    return list_ans
 
 
-async def get_student_info(client, student_id):
+async def get_student_info(client: IrisClient, student_id):
     """Support for fetching Student info by student id."""
-    student_info = {}
+    student_info: dict[str, str | int] = {}
     for student in await client.get_students():
         if str(student.pupil.id) == str(student_id):
             student_info["first_name"] = student.pupil.first_name
             if student.pupil.second_name:
                 student_info["second_name"] = student.pupil.second_name
-            student_info["last_name"] = student.pupil.last_name
-            student_info["full_name"] = (
-                f"{student.pupil.first_name} {student.pupil.last_name}"
+            student_info["last_name"] = student.pupil.surname
+            full_name = " ".join(
+                part
+                for part in [
+                    student.pupil.first_name,
+                    student.pupil.second_name,
+                    student.pupil.surname,
+                ]
+                if part
             )
+            student_info["full_name"] = full_name
             student_info["id"] = student.pupil.id
-            student_info["class"] = student.class_
-            student_info["school"] = student.school.name
-            student_info["symbol"] = student.symbol
+            student_info["class"] = student.class_display or "-"
+            student_info["school"] = student.unit.display_name
+            student_info["symbol"] = student.links.symbol
             break
     return student_info
 
 
-async def get_lucky_number(client):
-    """Retrieve the lucky number and its date.
-
-    Args:
-        client: The client object used to retrieve the lucky number.
-
-    Returns:
-        A dictionary containing the lucky number and its date.
-
-    """
-    lucky_number = {}
-    number = await client.data.get_lucky_number()
-    try:
-        lucky_number["number"] = number.number
-        lucky_number["date"] = number.date.strftime("%d.%m.%Y")
-    except Exception:
+async def get_lucky_number(client: IrisClient):
+    """Retrieve the lucky number and its date."""
+    lucky_number: dict[str, str | int] = {}
+    number = await client.get_lucky_number()
+    if number:
+        try:
+            lucky_number["number"] = number.number
+            lucky_number["date"] = number.day.strftime("%d.%m.%Y")
+        except Exception:  # pylint: disable=broad-except
+            lucky_number = {"number": "-", "date": "-"}
+    if not lucky_number:
         lucky_number = {"number": "-", "date": "-"}
     return lucky_number
 
 
-async def get_latest_attendance(client):
-    """Retrieve the details of the latest attendance.
-
-    Args:
-        client: The client object used to retrieve the attendance.
-
-    Returns:
-        A dictionary containing the details of the latest attendance.
-
-    """
-    latest_attendance = {}
-    async for attendance in await client.data.get_attendance():
+async def get_latest_attendance(client: IrisClient):
+    """Retrieve the details of the latest attendance."""
+    latest_attendance: dict[str, str | int] = {}
+    date_to = datetime.date.today()
+    date_from = date_to - datetime.timedelta(days=30)
+    lessons = await client.get_completed_lessons(date_from=date_from, date_to=date_to)
+    lessons.sort(key=lambda lesson: lesson.modified_at, reverse=True)
+    for attendance in lessons:
         if attendance.presence_type is not None:
             latest_attendance["content"] = attendance.presence_type.name
-            latest_attendance["lesson_name"] = attendance.subject.name
-            latest_attendance["lesson_number"] = attendance.time.position
-            latest_attendance["lesson_date"] = str(attendance.date.date)
-            latest_attendance["lesson_time"] = (
-                f"{attendance.time.from_.strftime('%H:%M')}-{attendance.time.to.strftime('%H:%M')}"
+            latest_attendance["lesson_name"] = (
+                attendance.subject.name if attendance.subject else "-"
             )
-            latest_attendance["datetime"] = attendance.date_modified.date_time
+            latest_attendance["lesson_number"] = attendance.lesson_number
+            latest_attendance["lesson_date"] = str(attendance.day)
+            latest_attendance["lesson_time"] = (
+                f"{attendance.time_slot.start.strftime('%H:%M')}-"
+                f"{attendance.time_slot.end.strftime('%H:%M')}"
+            )
+            latest_attendance["datetime"] = attendance.modified_at
+            break
     if not latest_attendance:
         latest_attendance = {
             "content": "-",
@@ -179,32 +182,26 @@ async def get_latest_attendance(client):
             "lesson_number": "-",
             "lesson_date": "-",
             "lesson_time": "-",
-            "datetime": "-",
+            "datetime": datetime.datetime.min,
         }
     return latest_attendance
 
 
-async def get_latest_grade(client):
-    """Retrieve the details of the latest grade.
+async def get_latest_grade(client: IrisClient):
+    """Retrieve the details of the latest grade."""
+    latest_grade: dict[str, str | int | float] = {}
 
-    Args:
-        client: The client object used to retrieve the grades.
-
-    Returns:
-        A dictionary containing the details of the latest grade.
-
-    """
-    latest_grade = {}
-
-    async for grade in await client.data.get_grades():
-        latest_grade = {}
+    grades = await client.get_grades()
+    grades.sort(key=lambda grade: grade.created_at, reverse=True)
+    for grade in grades:
         latest_grade["content"] = grade.content
+        latest_grade["date"] = grade.created_at.date().strftime("%d.%m.%Y")
         latest_grade["weight"] = grade.column.weight
         latest_grade["description"] = grade.column.name
-        latest_grade["value"] = grade.value
-        latest_grade["teacher"] = grade.teacher_created.display_name
         latest_grade["subject"] = grade.column.subject.name
-        latest_grade["date"] = grade.date_created.date.strftime("%d.%m.%Y")
+        latest_grade["teacher"] = grade.creator.display_name
+        latest_grade["value"] = grade.value or 0
+        break
     if not latest_grade:
         latest_grade = {
             "content": "-",
@@ -218,31 +215,22 @@ async def get_latest_grade(client):
     return latest_grade
 
 
-async def get_next_homework(client):
-    """Retrieve the details of the next homework.
-
-    Args:
-        client: The client object used to retrieve the homework.
-
-    Returns:
-        A dictionary containing the details of the next homework.
-
-    """
-    next_homework = {}
-    async for homework in await client.data.get_homework():
-        for i in range(7):
-            if (
-                homework.deadline.date >= datetime.date.today()
-                and homework.deadline.date
-                <= datetime.date.today() + datetime.timedelta(i)
-            ):
-                next_homework = {}
-                next_homework["description"] = homework.content
-                next_homework["subject"] = homework.subject.name
-                next_homework["teacher"] = homework.creator.display_name
-                next_homework["date"] = homework.deadline.date.strftime("%d.%m.%Y")
-                if homework.content is not None:
-                    break
+async def get_next_homework(client: IrisClient):
+    """Retrieve the details of the next homework."""
+    next_homework: dict[str, str] = {}
+    today = datetime.date.today()
+    deadline_limit = today + datetime.timedelta(days=7)
+    homework_list = await client.get_homework_range(date_from=today, date_to=deadline_limit)
+    homework_list.sort(key=lambda homework: homework.deadline)
+    for homework in homework_list:
+        if today <= homework.deadline <= deadline_limit:
+            next_homework = {
+                "description": homework.content,
+                "subject": homework.subject.name,
+                "teacher": homework.creator.display_name,
+                "date": homework.deadline.strftime("%d.%m.%Y"),
+            }
+            break
     if not next_homework:
         next_homework = {
             "description": "Brak zadań domowych",
@@ -253,33 +241,27 @@ async def get_next_homework(client):
     return next_homework
 
 
-async def get_next_exam(client):
-    """Retrieve the details of the next exam.
-
-    Args:
-        client: The client object used to retrieve the exams.
-
-    Returns:
-        A dictionary containing the details of the next exam.
-
-    """
-    next_exam = {}
-    async for exam in await client.data.get_exams():
-        for i in range(7):
-            if (
-                exam.deadline.date >= datetime.date.today()
-                and exam.deadline.date <= datetime.date.today() + datetime.timedelta(i)
-            ):
-                next_exam = {}
-                next_exam["description"] = exam.topic
-                if exam.topic == "":
-                    next_exam["description"] = f"{exam.type} {exam.subject.name}"
-                next_exam["subject"] = exam.subject.name
-                next_exam["type"] = exam.type
-                next_exam["teacher"] = exam.creator.display_name
-                next_exam["date"] = exam.deadline.date.strftime("%d.%m.%Y")
-                if exam.type is not None:
-                    break
+async def get_next_exam(client: IrisClient):
+    """Retrieve the details of the next exam."""
+    next_exam: dict[str, str] = {}
+    today = datetime.date.today()
+    deadline_limit = today + datetime.timedelta(days=7)
+    exams = await client.get_exams_range(date_from=today, date_to=deadline_limit)
+    exams.sort(key=lambda exam: exam.deadline)
+    for exam in exams:
+        deadline_date = exam.deadline.date()
+        if today <= deadline_date <= deadline_limit:
+            description = exam.content or exam.subject.name
+            if not description:
+                description = exam.type
+            next_exam = {
+                "description": description,
+                "subject": exam.subject.name,
+                "type": exam.type,
+                "teacher": exam.creator.display_name,
+                "date": deadline_date.strftime("%d.%m.%Y"),
+            }
+            break
     if not next_exam:
         next_exam = {
             "description": "Brak sprawdzianów",
@@ -291,21 +273,13 @@ async def get_next_exam(client):
     return next_exam
 
 
-async def get_latest_message(client):
-    """Retrieve the latest message from the client's message boxes.
-
-    Args:
-        client: The client object used to retrieve the messages.
-
-    Returns:
-        A dictionary containing the details of the latest message.
-
-    """
+async def get_latest_message(client: IrisClient):
+    """Retrieve the latest message from the client's message boxes."""
     latest_message: dict[str, int | str] = {"timestamp": 0}
-    async for message in await client.data.get_messages(
-        client.student.message_box.global_key
-    ):
-        if message.sent_date.timestamp > latest_message["timestamp"]:
+    messages = await client.get_messages()
+    for message in messages:
+        timestamp = int(message.sent_at.timestamp())
+        if timestamp > latest_message["timestamp"]:
             latest_message["id"] = message.id
             latest_message["title"] = message.subject
             latest_message["content"] = re.sub(
@@ -318,10 +292,11 @@ async def get_latest_message(client):
             else:
                 latest_message["sender"] = "Nieznany"
             latest_message["date"] = (
-                f"{message.sent_date.time.strftime('%H:%M')} {message.sent_date.date.strftime('%d.%m.%Y')}"
+                f"{message.sent_at.time().strftime('%H:%M')} "
+                f"{message.sent_at.date().strftime('%d.%m.%Y')}"
             )
-            latest_message["timestamp"] = message.sent_date.timestamp
-    if not latest_message:
+            latest_message["timestamp"] = timestamp
+    if latest_message == {"timestamp": 0}:
         latest_message = {
             "id": 0,
             "title": "-",
@@ -329,114 +304,96 @@ async def get_latest_message(client):
             "date": "-",
             "sender": "-",
         }
+    else:
+        latest_message.pop("timestamp", None)
     return latest_message
 
 
-async def get_exams_list(client, date_from=None, date_to=None):
-    """Retrieve the list of exams.
+async def get_exams_list(
+    client: IrisClient, date_from: datetime.datetime | None = None, date_to: datetime.datetime | None = None
+):
+    """Retrieve the list of exams."""
 
-    Args:
-        client: The client object used to retrieve the exams.
-        date_from: The date from which the exams should be retrieved.
-        date_to: The date to which the exams should be retrieved.
-
-    Returns:
-        A list containing the details of the exams.
-
-    """
-
-    class DateAndSubject:
-        def __init__(self, date, subject) -> None:
-            self.date = date
-            self.subject = subject
-
-        def __eq__(self, another):
-            return self.date == another.date and self.subject == another.subject
-
-        def __hash__(self):
-            return hash((self.date, self.subject))
+    if date_from is None and date_to is None:
+        today = datetime.date.today()
+        date_from = datetime.datetime.combine(today, datetime.time.min).replace(
+            tzinfo=ZoneInfo("Europe/Warsaw")
+        )
+        date_to = datetime.datetime.combine(today, datetime.time.max).replace(
+            tzinfo=ZoneInfo("Europe/Warsaw")
+        )
 
     exams_list = []
-    lessons_dict = {}
-    async for lesson in await client.data.get_lessons(
-        date_from=date_from, date_to=date_to
-    ):
-        if lesson.subject and lesson.date:
-            if (
-                DateAndSubject(lesson.date.date, lesson.subject.id) not in lessons_dict
-                or lesson.time.position
-                < lessons_dict[
-                    DateAndSubject(lesson.date.date, lesson.subject.id)
-                ].time.position
-            ):
-                lessons_dict[DateAndSubject(lesson.date.date, lesson.subject.id)] = (
-                    lesson
+    lessons_dict: dict[tuple[datetime.date, int], object] = {}
+    schedule = await client.get_schedule(
+        date_from=date_from.date(),
+        date_to=date_to.date(),
+    )
+    for lesson in schedule:
+        if lesson.subject:
+            key = (lesson.date_, lesson.subject.id)
+            existing = lessons_dict.get(key)
+            if not existing or lesson.time_slot.position < existing.time_slot.position:
+                lessons_dict[key] = lesson
+
+    exams = await client.get_exams_range(date_from=date_from.date(), date_to=date_to.date())
+    for exam in exams:
+        exam_time = exam.deadline.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
+        if date_from <= exam_time <= date_to and exam.type is not None:
+            key = (exam.deadline.date(), exam.subject.id)
+            timeslot = lessons_dict.get(key)
+            if not timeslot:
+                additional_schedule = await client.get_schedule(
+                    date_from=exam.deadline.date(), date_to=exam.deadline.date()
                 )
-    async for exam in await client.data.get_exams():
-        if (date_from is None and date_to is None) or (
-            exam.deadline.date_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
-            >= date_from
-            and exam.deadline.date_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
-            <= date_to
-            and exam.type is not None
-        ):
-            try:
-                timeslot = lessons_dict[
-                    DateAndSubject(exam.deadline.date, exam.subject.id)
-                ].time
-            except KeyError:
-                async for lesson in await client.data.get_lessons(
-                    date_from=exam.deadline.date
-                ):
-                    if lesson.subject and lesson.date:
-                        lessons_dict[
-                            DateAndSubject(lesson.date.date, lesson.subject.id)
-                        ] = lesson
-                try:
-                    timeslot = lessons_dict[
-                        DateAndSubject(exam.deadline.date, exam.subject.id)
-                    ].time
-                except KeyError:
-                    timeslot = None
+                for lesson in additional_schedule:
+                    if lesson.subject:
+                        lessons_dict[(lesson.date_, lesson.subject.id)] = lesson
+                timeslot = lessons_dict.get(key)
             exams_list.append(
                 {
-                    "title": exam.topic,
+                    "title": exam.content or exam.subject.name,
                     "subject": exam.subject.name,
                     "type": exam.type,
                     "teacher": exam.creator.display_name,
-                    "date": exam.deadline.date,
-                    "time": timeslot,
+                    "date": exam.deadline.date(),
+                    "time": timeslot.time_slot if timeslot else None,
                 }
             )
     return exams_list
 
 
-async def get_homework_list(client, date_from=None, date_to=None):
-    """Retrieve the list of homework.
+async def get_homework_list(
+    client: IrisClient,
+    date_from: datetime.datetime | None = None,
+    date_to: datetime.datetime | None = None,
+):
+    """Retrieve the list of homework."""
 
-    Args:
-        client: The client object used to retrieve the homework.
-        date_from: The date from which the homework should be retrieved.
-        date_to: The date to which the homework should be retrieved.
+    if date_from is None and date_to is None:
+        today = datetime.date.today()
+        date_from = datetime.datetime.combine(today, datetime.time.min).replace(
+            tzinfo=ZoneInfo("Europe/Warsaw")
+        )
+        date_to = datetime.datetime.combine(today, datetime.time.max).replace(
+            tzinfo=ZoneInfo("Europe/Warsaw")
+        )
 
-    Returns:
-        A list containing the details of the homework.
-
-    """
     homework_list = []
-    async for homework in await client.data.get_homework():
-        if (date_from is None and date_to is None) or (
-            homework.deadline.date_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
-            >= date_from
-            and homework.deadline.date_time.replace(tzinfo=ZoneInfo("Europe/Warsaw"))
-            <= date_to
-        ):
+    homeworks = await client.get_homework_range(
+        date_from=date_from.date(), date_to=date_to.date()
+    )
+    for homework in homeworks:
+        deadline = datetime.datetime.combine(
+            homework.deadline, datetime.time.min, tzinfo=ZoneInfo("Europe/Warsaw")
+        )
+        if date_from <= deadline <= date_to:
             homework_list.append(
                 {
                     "description": homework.content,
                     "subject": homework.subject.name,
                     "teacher": homework.creator.display_name,
-                    "date": homework.deadline.date,
+                    "date": homework.deadline,
                 }
             )
     return homework_list

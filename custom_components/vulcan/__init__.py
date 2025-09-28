@@ -1,6 +1,10 @@
 """The Vulcan component."""
 
+from __future__ import annotations
+
 import logging
+import sys
+from pathlib import Path
 
 from aiohttp import ClientConnectorError
 from homeassistant.config_entries import ConfigEntry
@@ -9,9 +13,19 @@ from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.entity import Entity
-from vulcan import Account, Keystore, UnauthorizedCertificateException, Vulcan
+
+COMPONENT_PATH = Path(__file__).parent
+if str(COMPONENT_PATH) not in sys.path:
+    sys.path.insert(0, str(COMPONENT_PATH))
 
 from .const import DOMAIN
+from .iris import (
+    CertificateNotFoundException,
+    FailedRequestException,
+    HttpUnsuccessfullStatusException,
+)
+from .iris.credentials import RsaCredential
+from .iris_client import IrisClient
 
 PLATFORMS = [Platform.CALENDAR, Platform.SENSOR]
 
@@ -23,17 +37,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Uonet+ Vulcan integration."""
     hass.data.setdefault(DOMAIN, {})
     try:
-        keystore = Keystore.load(entry.data["keystore"])
-        account = Account.load(entry.data["account"])
-        client = Vulcan(keystore, account, async_get_clientsession(hass))
-        await client.select_student()
-        students = await client.get_students()
-        for student in students:
-            if str(student.pupil.id) == str(entry.data["student_id"]):
-                client.student = student
-                break
-    except UnauthorizedCertificateException as err:
+        credential = RsaCredential.model_validate(entry.data["credential"])
+        client = IrisClient(credential, async_get_clientsession(hass))
+        await client.select_student(entry.data["student_id"])
+    except CertificateNotFoundException as err:
         raise ConfigEntryAuthFailed("The certificate is not authorized.") from err
+    except ValueError as err:
+        raise ConfigEntryAuthFailed(str(err)) from err
+    except (FailedRequestException, HttpUnsuccessfullStatusException) as err:
+        raise ConfigEntryNotReady(
+            f"Connection error - please check your internet connection: {err}"
+        ) from err
     except ClientConnectorError as err:
         raise ConfigEntryNotReady(
             f"Connection error - please check your internet connection: {err}"
